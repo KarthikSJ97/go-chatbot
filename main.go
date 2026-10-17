@@ -6,7 +6,11 @@ import (
 	"os"
 
 	"github.com/gofiber/fiber/v2"
-	"github.com/google/genai"
+	"google.golang.org/genai"
+)
+
+const(
+	GEMINI_API_KEY = "GEMINI_API_KEY"
 )
 
 // ChatRequest defines the payload structure incoming from the client
@@ -22,8 +26,16 @@ type ChatResponse struct {
 func main() {
 	ctx := context.Background()
 
-	// Initialize the Gemini client (it automatically looks for GEMINI_API_KEY environment variable)
-	client, err := genai.NewClient(ctx, nil)
+	// Retrieve the API key directly from the OS environment
+	apiKey := os.Getenv(GEMINI_API_KEY)
+	if apiKey == "" {
+		log.Fatal(GEMINI_API_KEY+" environment variable is not set")
+	}
+
+	// Initialize the Gemini client using the retrieved key
+	client, err := genai.NewClient(ctx, &genai.ClientConfig{
+		APIKey: apiKey,
+	})
 	if err != nil {
 		log.Fatalf("Failed to create Gemini client: %v", err)
 	}
@@ -48,7 +60,7 @@ func main() {
 		// Call Gemini API using the fast and free-tier friendly flash model
 		resp, err := client.Models.GenerateContent(
 			ctx,
-			"gemini-2.5-flash",
+			"gemini-3.8-flash",
 			genai.Text(req.Message),
 			nil,
 		)
@@ -59,11 +71,8 @@ func main() {
 			})
 		}
 
-		// Extract the text response from the model
-		answer := resp.Text()
-
 		return c.JSON(ChatResponse{
-			Reply: answer,
+			Reply: resp.Text(),
 		})
 	})
 
