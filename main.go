@@ -1,15 +1,18 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"fmt"
 	"log"
 	"os"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/valyala/fasthttp"
 	"google.golang.org/genai"
 )
 
-const(
+const (
 	GEMINI_API_KEY = "GEMINI_API_KEY"
 )
 
@@ -18,18 +21,13 @@ type ChatRequest struct {
 	Message string `json:"message"`
 }
 
-// ChatResponse defines the outgoing response payload
-type ChatResponse struct {
-	Reply string `json:"reply"`
-}
-
 func main() {
 	ctx := context.Background()
 
 	// Retrieve the API key directly from the OS environment
 	apiKey := os.Getenv(GEMINI_API_KEY)
 	if apiKey == "" {
-		log.Fatal(GEMINI_API_KEY+" environment variable is not set")
+		log.Fatal(GEMINI_API_KEY + " environment variable is not set")
 	}
 
 	// Initialize the Gemini client using the retrieved key
@@ -42,7 +40,7 @@ func main() {
 
 	app := fiber.New()
 
-	// POST /chat endpoint (stateless - no history)
+	// POST /chat endpoint (stateless streaming using SSE)
 	app.Post("/chat", func(c *fiber.Ctx) error {
 		var req ChatRequest
 		if err := c.BodyParser(&req); err != nil {
@@ -57,23 +55,46 @@ func main() {
 			})
 		}
 
-		// Call Gemini API using the fast and free-tier friendly flash model
-		resp, err := client.Models.GenerateContent(
-			ctx,
-			"gemini-3.8-flash",
-			genai.Text(req.Message),
-			nil,
-		)
-		if err != nil {
-			log.Printf("Gemini API error: %v", err)
-			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-				"error": "Failed to generate response from AI model",
-			})
-		}
+		// Set required SSE headers for Fiber
+		c.Set("Content-Type", "text/event-stream")
+		c.Set("Cache-Control", "no-cache")
+		c.Set("Connection", "keep-alive")
+		c.Set("Transfer-Encoding", "chunked")
 
-		return c.JSON(ChatResponse{
-			Reply: resp.Text(),
-		})
+		// Stream response back via fasthttp stream writer
+		c.Context().SetBodyStreamWriter(fasthttp.StreamWriter(func(w *bufio.Writer) {
+			iter := client.Models.GenerateContentStream(
+				ctx,
+				"gemini-3.8-flash",
+				genai.Text(req.Message),
+				nil,
+			)
+
+			for resp, err := range iter {
+				if err != nil {
+					log.Printf("Gemini stream error: %v", err)
+					fmt.Fprintf(w, "event: error\ndata: %s\n\n", err.Error())
+					w.Flush()
+					return
+				}
+
+				// Extract text and stream immediately to client
+				if len(resp.Candidates) > 0 && resp.Candidates[0].Content != nil {
+					for _, part := range resp.Candidates[0].Content.Parts {
+						if part.Text != "" {
+							fmt.Fprintf(w, "data: %s\n\n", part.Text)
+							w.Flush()
+						}
+					}
+				}
+			}
+
+			// End event to signal completion
+			fmt.Fprintf(w, "event: end\ndata: [DONE]\n\n")
+			w.Flush()
+		}))
+
+		return nil
 	})
 
 	log.Println("Server is running on port 8080...")
