@@ -40,7 +40,7 @@ func main() {
 
 	app := fiber.New()
 
-	// POST /chat endpoint (stateless streaming using SSE)
+	// POST /chat endpoint (stateless streaming with metadata logging)
 	app.Post("/chat", func(c *fiber.Ctx) error {
 		var req ChatRequest
 		if err := c.BodyParser(&req); err != nil {
@@ -84,6 +84,27 @@ func main() {
 						if part.Text != "" {
 							fmt.Fprintf(w, "data: %s\n\n", part.Text)
 							w.Flush()
+						}
+					}
+				}
+
+				// Log token usage metadata if present in the chunk
+				if resp.UsageMetadata != nil {
+					log.Printf("[Token Usage] Prompt: %d | Candidates: %d | Total: %d",
+						resp.UsageMetadata.PromptTokenCount,
+						resp.UsageMetadata.CandidatesTokenCount,
+						resp.UsageMetadata.TotalTokenCount,
+					)
+				}
+
+				// Log candidate details like finish reason and safety ratings
+				for _, candidate := range resp.Candidates {
+					if candidate.FinishReason != "" {
+						log.Printf("[Finish Reason]: %v", candidate.FinishReason)
+					}
+					if len(candidate.SafetyRatings) > 0 {
+						for _, rating := range candidate.SafetyRatings {
+							log.Printf("[Safety Rating] Category: %v | Probability: %v", rating.Category, rating.Probability)
 						}
 					}
 				}
