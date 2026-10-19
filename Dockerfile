@@ -20,7 +20,7 @@ COPY . .
 RUN go mod tidy
 
 # Build a statically linked Go binary
-RUN CGO_ENABLED=0 GOOS=linux go build -o chatbot main.go
+RUN CGO_ENABLED=0 GOOS=linux go build -o chatbot .
 
 # Stage 2: Create a lightweight final image
 FROM alpine:latest
