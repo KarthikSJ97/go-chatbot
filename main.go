@@ -3,18 +3,21 @@ package main
 import (
 	"bufio"
 	"context"
+	"database/sql"
 	"fmt"
 	"log"
 	"os"
-	"sync"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/google/uuid"
+	_ "github.com/lib/pq" // <--- This blank import is mandatory for database/sql
 	"github.com/valyala/fasthttp"
 	"google.golang.org/genai"
 )
 
 const (
 	GEMINI_API_KEY = "GEMINI_API_KEY"
+	DATABASE_URL   = "DATABASE_URL"
 )
 
 // ChatRequest defines the payload structure incoming from the client
@@ -27,11 +30,6 @@ type ChatResponse struct {
 	Reply  string `json:"reply"`
 	ChatID string `json:"chatId,omitempty"`
 }
-
-var (
-	chatSessions = make(map[string]*genai.Chat)
-	sessionMutex sync.RWMutex
-)
 
 func main() {
 	ctx := context.Background()
@@ -48,6 +46,48 @@ func main() {
 	})
 	if err != nil {
 		log.Fatalf("Failed to create Gemini client: %v", err)
+	}
+
+	// Retrieve DB credentials from environment variables
+	dbUser := os.Getenv("DB_USER")
+	dbPassword := os.Getenv("DB_PASSWORD")
+	dbName := os.Getenv("DB_NAME")
+	dbHost := os.Getenv("DB_HOST")
+	dbPort := os.Getenv("DB_PORT")
+
+	if dbUser == "" || dbPassword == "" || dbName == "" || dbHost == "" || dbPort == "" {
+		log.Fatal("Database environment variables are not fully set")
+	}
+
+	dbURL := fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable",
+		dbUser, dbPassword, dbHost, dbPort, dbName,
+	)
+
+	// Connect to PostgreSQL
+	db, err := sql.Open("postgres", dbURL)
+	if err != nil {
+		log.Fatalf("Failed to connect to database: %v", err)
+	}
+	defer db.Close()
+
+	if err := db.Ping(); err != nil {
+		log.Fatalf("Database ping failed: %v", err)
+	}
+	log.Println("Successfully connected to PostgreSQL database.")
+
+	// Ensure database schema exists
+	_, err = db.Exec(`
+		CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+		CREATE TABLE IF NOT EXISTS chat_history (
+			id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+			chat_id UUID NOT NULL,
+			prompt TEXT NOT NULL,
+			response TEXT NOT NULL,
+			created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+		);
+	`)
+	if err != nil {
+		log.Fatalf("Failed to create chat_history table: %v", err)
 	}
 
 	app := fiber.New()
@@ -130,7 +170,7 @@ func main() {
 		return nil
 	})
 
-	// 2. New Context-Aware, Non-Streaming JSON Endpoint
+	// 2. Context-Aware, Non-Streaming JSON Endpoint backed by PostgreSQL
 	app.Post("/chat/context", func(c *fiber.Ctx) error {
 		var req ChatRequest
 		if err := c.BodyParser(&req); err != nil {
@@ -141,36 +181,73 @@ func main() {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Message cannot be empty"})
 		}
 
-		// If no chatId is provided, generate a fallback or handle as fresh chat
-		chatID := req.ChatID
-		if chatID == "" {
-			chatID = "default-chat-" + fmt.Sprintf("%d", os.Getpid()) // Simple fallback ID if omitted
-		}
+		var chatUUID uuid.UUID
+		var parseErr error
 
-		sessionMutex.Lock()
-		chatSession, exists := chatSessions[chatID]
-		if !exists {
-			var err error
-			chatSession, err = client.Chats.Create(ctx, "gemini-3.8-flash", nil, nil)
-			if err != nil {
-				sessionMutex.Unlock()
-				log.Printf("Failed to create chat session: %v", err)
-				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to initialize chat session"})
+		if req.ChatID == "" {
+			// Fresh chat: generate a random UUID
+			chatUUID = uuid.New()
+		} else {
+			chatUUID, parseErr = uuid.Parse(req.ChatID)
+			if parseErr != nil {
+				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid chatId UUID format"})
 			}
-			chatSessions[chatID] = chatSession
 		}
-		sessionMutex.Unlock()
 
-		// Send message synchronously (non-streaming)
-		resp, err := chatSession.SendMessage(ctx, genai.Part{Text: req.Message})
+		// Load prior history for this chatId from PostgreSQL to build context
+		rows, err := db.QueryContext(ctx, "SELECT prompt, response FROM chat_history WHERE chat_id = $1 ORDER BY created_at ASC", chatUUID)
+		if err != nil {
+			log.Printf("Database query error: %v", err)
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to fetch chat history"})
+		}
+		defer rows.Close()
+
+		var history []*genai.Content
+		for rows.Next() {
+			var dbPrompt, dbResponse string
+			if err := rows.Scan(&dbPrompt, &dbResponse); err != nil {
+				continue
+			}
+			// Append historical turn (User -> Model)
+			history = append(history, &genai.Content{
+				Role:  "user",
+				Parts: []*genai.Part{{Text: dbPrompt}},
+			})
+			history = append(history, &genai.Content{
+				Role:  "model",
+				Parts: []*genai.Part{{Text: dbResponse}},
+			})
+		}
+
+		// Create a Gemini chat session initialized with historical context
+		chatSession, err := client.Chats.Create(ctx, "gemini-3.8-flash", nil, history)
+		if err != nil {
+			log.Printf("Failed to create chat session: %v", err)
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to initialize chat session"})
+		}
+
+		// Send new prompt to model
+		aiResp, err := chatSession.SendMessage(ctx, genai.Part{Text: req.Message})
 		if err != nil {
 			log.Printf("Gemini API error: %v", err)
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to generate response"})
 		}
 
+		replyText := aiResp.Text()
+
+		// Persist the new turn into PostgreSQL
+		_, err = db.ExecContext(ctx,
+			"INSERT INTO chat_history (chat_id, prompt, response) VALUES ($1, $2, $3)",
+			chatUUID, req.Message, replyText,
+		)
+		if err != nil {
+			log.Printf("Failed to save chat history to database: %v", err)
+			// Non-fatal for the response, but good to log
+		}
+
 		return c.JSON(ChatResponse{
-			Reply:  resp.Text(),
-			ChatID: chatID,
+			Reply:  replyText,
+			ChatID: chatUUID.String(),
 		})
 	})
 
