@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"context"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
@@ -42,7 +43,9 @@ func RegisterChatRoutes(app *fiber.App, db *sql.DB, client *genai.Client) {
 		c.Set("Transfer-Encoding", "chunked")
 
 		c.Context().SetBodyStreamWriter(fasthttp.StreamWriter(func(w *bufio.Writer) {
-			streamCtx := c.Context()
+			// Use context.Background() instead of c.Context() to prevent fasthttp context incompatibility panic
+			streamCtx := context.Background()
+			
 			iter := client.Models.GenerateContentStream(
 				streamCtx,
 				"gemini-3.8-flash",
@@ -58,13 +61,14 @@ func RegisterChatRoutes(app *fiber.App, db *sql.DB, client *genai.Client) {
 					return
 				}
 
-				if len(resp.Candidates) > 0 && resp.Candidates[0].Content != nil {
-					for _, part := range resp.Candidates[0].Content.Parts {
-						if part.Text != "" {
-							fmt.Fprintf(w, "data: %s\n\n", part.Text)
-							w.Flush()
-						}
-					}
+				if resp == nil {
+					continue
+				}
+
+				// Safely extract and stream text using the built-in Text() method
+				if t := resp.Text(); t != "" {
+					fmt.Fprintf(w, "data: %s\n\n", t)
+					w.Flush()
 				}
 
 				if resp.UsageMetadata != nil {
@@ -76,12 +80,17 @@ func RegisterChatRoutes(app *fiber.App, db *sql.DB, client *genai.Client) {
 				}
 
 				for _, candidate := range resp.Candidates {
+					if candidate == nil {
+						continue
+					}
 					if candidate.FinishReason != "" {
 						log.Printf("[Finish Reason]: %v", candidate.FinishReason)
 					}
 					if len(candidate.SafetyRatings) > 0 {
 						for _, rating := range candidate.SafetyRatings {
-							log.Printf("[Safety Rating] Category: %v | Probability: %v", rating.Category, rating.Probability)
+							if rating != nil {
+								log.Printf("[Safety Rating] Category: %v | Probability: %v", rating.Category, rating.Probability)
+							}
 						}
 					}
 				}
