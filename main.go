@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sync"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/valyala/fasthttp"
@@ -18,8 +19,19 @@ const (
 
 // ChatRequest defines the payload structure incoming from the client
 type ChatRequest struct {
+	ChatID  string `json:"chatId,omitempty"`
 	Message string `json:"message"`
 }
+
+type ChatResponse struct {
+	Reply  string `json:"reply"`
+	ChatID string `json:"chatId,omitempty"`
+}
+
+var (
+	chatSessions = make(map[string]*genai.Chat)
+	sessionMutex sync.RWMutex
+)
 
 func main() {
 	ctx := context.Background()
@@ -116,6 +128,50 @@ func main() {
 		}))
 
 		return nil
+	})
+
+	// 2. New Context-Aware, Non-Streaming JSON Endpoint
+	app.Post("/chat/context", func(c *fiber.Ctx) error {
+		var req ChatRequest
+		if err := c.BodyParser(&req); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid request body"})
+		}
+
+		if req.Message == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Message cannot be empty"})
+		}
+
+		// If no chatId is provided, generate a fallback or handle as fresh chat
+		chatID := req.ChatID
+		if chatID == "" {
+			chatID = "default-chat-" + fmt.Sprintf("%d", os.Getpid()) // Simple fallback ID if omitted
+		}
+
+		sessionMutex.Lock()
+		chatSession, exists := chatSessions[chatID]
+		if !exists {
+			var err error
+			chatSession, err = client.Chats.Create(ctx, "gemini-3.8-flash", nil, nil)
+			if err != nil {
+				sessionMutex.Unlock()
+				log.Printf("Failed to create chat session: %v", err)
+				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to initialize chat session"})
+			}
+			chatSessions[chatID] = chatSession
+		}
+		sessionMutex.Unlock()
+
+		// Send message synchronously (non-streaming)
+		resp, err := chatSession.SendMessage(ctx, genai.Part{Text: req.Message})
+		if err != nil {
+			log.Printf("Gemini API error: %v", err)
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to generate response"})
+		}
+
+		return c.JSON(ChatResponse{
+			Reply:  resp.Text(),
+			ChatID: chatID,
+		})
 	})
 
 	log.Println("Server is running on port 8080...")
